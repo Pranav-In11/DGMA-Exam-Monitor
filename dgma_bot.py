@@ -128,46 +128,108 @@ class DGMABot:
         self.send_tg_message("OCR Failed. Manual verification required.")
         return self.send_tg_photo_and_wait(base64_image)
 
-    def login(self):
-        """Execute Login and verify success URL."""
+    def login(self, max_retries=10):
+        """Execute Login with automatic proxy retry and a direct connection fallback."""
         login_url = f"{self.base_url}/j_security_check"
-        self.session.proxies = self.rotator.get_proxy()
+
+        # --- SAFEGUARD 1: Proxy Retry Loop ---
+        for attempt in range(1, max_retries + 1):
+            proxy = self.rotator.get_proxy()
+            
+            # If we run out of proxies, refresh the pool
+            if not proxy:
+                print("Proxy list exhausted. Refreshing proxies...")
+                self.rotator.refresh_proxies()
+                proxy = self.rotator.get_proxy()
+
+            self.session.proxies = proxy
+            print(f"[Attempt {attempt}/{max_retries}] Trying proxy: {proxy.get('http')}")
+
+            try:
+                # Load login page to get Captcha (Connect timeout: 5s, Read timeout: 12s)
+                resp = self.session.get(login_url, timeout=(5, 12))
+                
+                if resp.status_code != 200:
+                    print(f"Bad status code {resp.status_code}, trying next proxy...")
+                    continue
+
+                # Find base64 image
+                match = re.search(r'id="capt[a-z]*Img"[^>]*src="([^"]+)"', resp.text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r'src="([^"]*captcha[^"]*)"', resp.text, re.IGNORECASE)
+                
+                if not match:
+                    print("Captcha image not found on page, trying next proxy...")
+                    continue
+                    
+                captcha_b64 = match.group(1)
+                captcha_text = self.solve_captcha(captcha_b64)
+
+                if not captcha_text:
+                    print("Could not get Captcha text, retrying...")
+                    continue
+
+                # Submit Login
+                payload = {
+                    'username': self.username,
+                    'password': self.password,
+                    'verifyCode': captcha_text,
+                    'latitude': '0.0',
+                    'longitude': '0.0'
+                }
+                
+                login_resp = self.session.post(login_url, data=payload, allow_redirects=True, timeout=(5, 15))
+                
+                # Check if login page redirected to homepage or logged in
+                if login_resp.url == f"{self.base_url}/homepage" or "logout" in login_resp.text.lower() or "dashboard" in login_resp.text.lower():
+                    self.send_tg_message("✅ Login Successful! Redirected to homepage.")
+                    return True
+                else:
+                    print("Login form submission failed (Invalid credentials/captcha), retrying...")
+                    continue
+
+            except (requests.exceptions.Timeout, requests.exceptions.ProxyError, requests.exceptions.ConnectionError) as e:
+                print(f"Proxy failed ({type(e).__name__}). Switching proxy...")
+                continue
+            except Exception as e:
+                print(f"Unexpected error during login attempt: {e}")
+                continue
+
+        # --- SAFEGUARD 2: Direct Connection Fallback ---
+        print("All proxy attempts failed. Attempting direct connection without proxy...")
+        self.session.proxies = {} # Clear proxies
         
         try:
-            # 1. Load login page to get Captcha
-            resp = self.session.get(login_url, timeout=15)
-            
-            # Find base64 image (matches both id="captchaImg" or similar source structures)
-            match = re.search(r'id="capt[a-z]*Img"[^>]*src="([^"]+)"', resp.text, re.IGNORECASE)[cite: 1]
-            if not match:
-                print("Captcha image not found.")
-                return False
+            resp = self.session.get(login_url, timeout=(5, 15))
+            if resp.status_code == 200:
+                match = re.search(r'id="capt[a-z]*Img"[^>]*src="([^"]+)"', resp.text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r'src="([^"]*captcha[^"]*)"', resp.text, re.IGNORECASE)
                 
-            captcha_b64 = match.group(1)
-            captcha_text = self.solve_captcha(captcha_b64)
+                if match:
+                    captcha_b64 = match.group(1)
+                    captcha_text = self.solve_captcha(captcha_b64)
 
-            # 2. Submit Login
-            payload = {
-                'username': self.username,
-                'password': self.password,
-                'verifyCode': captcha_text,
-                'latitude': '0.0',
-                'longitude': '0.0'
-            }
-            
-            login_resp = self.session.post(login_url, data=payload, allow_redirects=True, timeout=15)
-            
-            # 3. Check if login page redirected to homepage
-            if login_resp.url == f"{self.base_url}/homepage" or "dashboard" in login_resp.text.lower():
-                self.send_tg_message("✅ Login Successful! Redirected to homepage.")
-                return True
-            else:
-                self.send_tg_message("❌ Login Failed.")
-                return False
-                
+                    if captcha_text:
+                        payload = {
+                            'username': self.username,
+                            'password': self.password,
+                            'verifyCode': captcha_text,
+                            'latitude': '0.0',
+                            'longitude': '0.0'
+                        }
+                        
+                        login_resp = self.session.post(login_url, data=payload, allow_redirects=True, timeout=(5, 15))
+                        
+                        if login_resp.url == f"{self.base_url}/homepage" or "logout" in login_resp.text.lower() or "dashboard" in login_resp.text.lower():
+                            self.send_tg_message("✅ Login Successful on Direct Connection!")
+                            return True
         except Exception as e:
-            print(f"Login Exception: {e}")
-            return False
+            print(f"Direct connection fallback also failed: {e}")
+
+        # Total Failure
+        self.send_tg_message("❌ Failed to log in after multiple proxy attempts AND direct fallback.")
+        return False
 
     def check_oral_updates(self):
         """Scrape the Oral Exam Updates page."""
