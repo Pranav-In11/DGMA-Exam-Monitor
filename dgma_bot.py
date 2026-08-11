@@ -1,316 +1,237 @@
-#!/usr/bin/env python3
-"""
-DGMA Exam Monitor - GitHub Actions Worker
-Runs on GitHub Actions with Indian proxy routing
-Stores results in Google Sheets
-Sends notifications via Google Apps Script
-"""
-
 import os
 import re
-import logging
-from datetime import datetime
-
+import time
+import random
 import requests
-from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
-# Load environment
-load_dotenv()
+class ProxyRotator:
+    def __init__(self):
+        self.proxies = []
+        self.sources = [
+            "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&country=in&proxy_format=protocolipport&format=text",
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/IN/data.txt"
+        ]
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('dgma_bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+    def refresh_proxies(self):
+        """Fetch fresh Indian proxies."""
+        new_proxies = []
+        for url in self.sources:
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    lines = response.text.splitlines()
+                    new_proxies.extend(lines)
+            except Exception as e:
+                print(f"Error fetching proxies from {url}: {e}")
+        
+        self.proxies = list(set([p.strip() for p in new_proxies if p.strip()]))
+        random.shuffle(self.proxies)
+        print(f"Refreshed {len(self.proxies)} proxies.")
 
-# Configuration
-CONFIG = {
-    'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
-    'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID'),
-    'SHEET_ID': os.getenv('SHEET_ID'),
-    'DGMA_USERNAME': os.getenv('DGMA_USERNAME'),
-    'DGMA_PASSWORD': os.getenv('DGMA_PASSWORD'),
-    'PROXY_URL': os.getenv('PROXY_URL'),
-    'PORTAL_URL': 'https://exams.dgma.gov.in',
-    'LOGIN_ACTION': 'https://exams.dgma.gov.in/j_security_check',
-    'GAS_ENDPOINT': os.getenv('GAS_ENDPOINT')  # Optional: Google Apps Script webhook
-}
+    def get_proxy(self):
+        if not self.proxies:
+            return None
+        proxy = self.proxies.pop(0)
+        # Ensure it has the protocol
+        if not proxy.startswith('http'):
+            proxy = f"http://{proxy}"
+        return {"http": proxy, "https": proxy}
 
 class DGMABot:
-    def __init__(self):
+    def __init__(self, telegram_token, chat_id, username, password):
         self.session = requests.Session()
-
-        # Set proxy if provided
-        if CONFIG['PROXY_URL']:
-            self.session.proxies = {
-                'http': CONFIG['PROXY_URL'],
-                'https': CONFIG['PROXY_URL']
-            }
-            logger.info(f"Using proxy: {CONFIG['PROXY_URL']}")
-
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
+        self.rotator = ProxyRotator()
+        self.rotator.refresh_proxies()
+        
+        # Credentials & Config
+        self.tg_token = telegram_token
+        self.chat_id = chat_id
+        self.username = username
+        self.password = password
+        self.base_url = "https://exams.dgma.gov.in"
 
-    def send_to_tg(self, message, msg_type='info'):
-        """Send message to Telegram"""
-        icons = {
-            'info': '📌',
-            'success': '✅',
-            'warning': '⚠️',
-            'error': '❌'
-        }
-
-        full_message = f"{icons.get(msg_type, '•')} {message}"
-
+    def send_tg_message(self, text):
+        """Send a standard text message to Telegram."""
+        url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
         try:
-            url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage"
-            requests.post(url, json={
-                'chat_id': CONFIG['TELEGRAM_CHAT_ID'],
-                'text': full_message,
-                'parse_mode': 'HTML'
-            }, timeout=10)
-            logger.info(full_message)
+            requests.post(url, json={'chat_id': self.chat_id, 'text': text})
         except Exception as e:
-            logger.error(f"Telegram error: {e}")
+            print(f"Telegram MSG Error: {e}")
 
-    def send_to_gas(self, data):
-        """Send data to Google Apps Script endpoint"""
-        if not CONFIG['GAS_ENDPOINT']:
-            return
-
+    def send_tg_photo_and_wait(self, base64_data):
+        """Send Captcha image to Telegram and wait for manual user input."""
+        import base64
+        url = f"https://api.telegram.org/bot{self.tg_token}/sendPhoto"
+        
+        # Strip data URI prefix if present
+        if ',' in base64_data:
+            base64_data = base64_data.split(',')[1]
+            
+        img_data = base64.b64decode(base64_data)
+        
         try:
-            requests.post(CONFIG['GAS_ENDPOINT'], json=data, timeout=10)
-            logger.info("Data sent to Google Apps Script")
+            # Send the photo
+            requests.post(
+                url, 
+                data={'chat_id': self.chat_id, 'caption': 'Please reply with the Captcha code:'},
+                files={'photo': ('captcha.jpg', img_data, 'image/jpeg')}
+            )
+            
+            # Poll for the user's response
+            print("Waiting for user to reply on Telegram...")
+            updates_url = f"https://api.telegram.org/bot{self.tg_token}/getUpdates"
+            
+            # Get current update ID to ignore old messages
+            resp = requests.get(updates_url).json()
+            last_update_id = resp['result'][-1]['update_id'] if resp.get('result') else 0
+            
+            while True:
+                time.sleep(3) # Check every 3 seconds
+                resp = requests.get(f"{updates_url}?offset={last_update_id + 1}").json()
+                if resp.get('result'):
+                    for update in resp['result']:
+                        if 'message' in update and 'text' in update['message']:
+                            captcha_text = update['message']['text'].strip()
+                            self.send_tg_message(f"Received Captcha: {captcha_text}")
+                            return captcha_text
+                        last_update_id = update['update_id']
         except Exception as e:
-            logger.error(f"GAS error: {e}")
-
-    def append_to_sheet(self, data):
-        """Append data to Google Sheet via Google Apps Script"""
-        payload = {
-            'action': 'append',
-            'timestamp': datetime.now().isoformat(),
-            'exam_date': data.get('exam_date', ''),
-            'oral_link': data.get('oral_link', ''),
-            'status': data.get('status', 'OK')
-        }
-
-        self.send_to_gas(payload)
+            print(f"Telegram Photo/Polling Error: {e}")
+            return input("Enter Captcha manually in CLI: ")
 
     def solve_captcha(self, base64_image):
-        """Solve captcha using OCR (online or local)"""
+        """Try online OCR first, fallback to manual Telegram verification."""
         try:
-            # Try free online OCR first
-            logger.info("Trying free OCR service...")
-
-            if ',' in base64_image:
-                base64_image = base64_image.split(',')[1]
-
+            print("Trying free OCR service...")[cite: 1]
+            clean_b64 = base64_image.split(',')[1] if ',' in base64_image else base64_image
             response = requests.post('https://api.ocr.space/parse', data={
-                'base64Image': f'data:image/jpeg;base64,{base64_image}',
+                'base64Image': f'data:image/jpeg;base64,{clean_b64}',
                 'language': 'eng',
-                'apikey': 'K87899142372222'  # Free demo key
+                'apikey': 'helloworld' # Replace with actual API key if available
             }, timeout=30)
-
+            
             result = response.json()
-
             if not result.get('IsErroredOnProcessing') and result.get('ParsedText'):
                 captcha = ''.join(c for c in result['ParsedText'] if c.isalnum())[:6].upper()
                 if len(captcha) >= 4:
-                    logger.info(f"OCR solved: {captcha}")
-                    self.send_to_tg(f'OCR solved: {captcha}', 'success')
+                    self.send_tg_message(f"OCR automatically solved Captcha: {captcha}")[cite: 1]
                     return captcha
-
-            return None
         except Exception as e:
-            logger.error(f"OCR error: {e}")
-            return None
+            print(f"OCR error: {e}")
+
+        # Fallback to Manual Telegram Verification
+        self.send_tg_message("OCR Failed. Manual verification required.")
+        return self.send_tg_photo_and_wait(base64_image)
 
     def login(self):
-        """Login to DGMA portal"""
+        """Execute Login and verify success URL."""
+        login_url = f"{self.base_url}/j_security_check"
+        self.session.proxies = self.rotator.get_proxy()
+        
         try:
-            self.send_to_tg('🔐 Logging in...', 'info')
-            logger.info("Fetching login page...")
-
-            # Fetch login page
-            response = self.session.get(CONFIG['LOGIN_ACTION'], timeout=15)
-
-            # Extract captcha
-            match = re.search(r'id="capt[a-z]*Img"[^>]*src="([^"]+)"', response.text, re.IGNORECASE)
+            # 1. Load login page to get Captcha
+            resp = self.session.get(login_url, timeout=15)
+            
+            # Find base64 image (matches both id="captchaImg" or similar source structures)
+            match = re.search(r'id="capt[a-z]*Img"[^>]*src="([^"]+)"', resp.text, re.IGNORECASE)[cite: 1]
             if not match:
-                match = re.search(r'src="([^"]*captcha[^"]*)"', response.text, re.IGNORECASE)
-            if not match:
-                self.send_to_tg('❌ Captcha not found', 'error')
-                return None
-
+                print("Captcha image not found.")
+                return False
+                
             captcha_b64 = match.group(1)
-            self.send_to_tg('📸 Found captcha', 'info')
-
-            # Solve captcha
-            self.send_to_tg('🤖 Solving captcha...', 'info')
             captcha_text = self.solve_captcha(captcha_b64)
 
-            if not captcha_text:
-                self.send_to_tg('⚠️ OCR failed - cannot get captcha', 'warning')
-                logger.warning("OCR failed, captcha solving skipped")
-                # Try with empty/random
-                captcha_text = 'ABCDEF'
-
-            # Submit login
-            self.send_to_tg('🔑 Submitting login...', 'info')
-
+            # 2. Submit Login
             payload = {
-                'username': CONFIG['DGMA_USERNAME'],
-                'password': CONFIG['DGMA_PASSWORD'],
+                'username': self.username,
+                'password': self.password,
                 'verifyCode': captcha_text,
                 'latitude': '0.0',
                 'longitude': '0.0'
             }
-
-            login_response = self.session.post(
-                CONFIG['LOGIN_ACTION'],
-                data=payload,
-                allow_redirects=True,
-                timeout=15
-            )
-
-            if any(x in login_response.text for x in ['Signout', 'logout', 'dashboard']):
-                self.send_to_tg('✅ Login successful!', 'success')
-                logger.info("Login successful")
-                return login_response.text
+            
+            login_resp = self.session.post(login_url, data=payload, allow_redirects=True, timeout=15)
+            
+            # 3. Check if login page redirected to homepage
+            if login_resp.url == f"{self.base_url}/homepage" or "dashboard" in login_resp.text.lower():
+                self.send_tg_message("✅ Login Successful! Redirected to homepage.")
+                return True
             else:
-                self.send_to_tg('❌ Login failed', 'error')
-                logger.error("Login failed")
-                return None
-
+                self.send_tg_message("❌ Login Failed.")
+                return False
+                
         except Exception as e:
-            self.send_to_tg(f'❌ Login error: {e}', 'error')
-            logger.error(f"Login error: {e}")
-            return None
+            print(f"Login Exception: {e}")
+            return False
 
-    def scrape(self, html=""):
-        """Scrape exam date and oral link"""
-        data = {}
+    def check_oral_updates(self):
+        """Scrape the Oral Exam Updates page."""
+        updates_url = f"{self.base_url}/oralExamUpdates"
+        resp = self.session.get(updates_url, timeout=15)
+        
+        if resp.status_code != 200:
+            self.send_tg_message("Failed to load Oral Exam Updates page.")
+            return
 
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        # Check if the "No Oral Examination" banner is present
+        if soup.find(string=re.compile("No Oral Examination Scheduled Today", re.I)):
+            self.send_tg_message("ℹ️ No Oral Examination Scheduled Today.")
+            return
+
+        # Scrape specific elements
         try:
-            page_content = html or ""
-            # Fetch dashboard if no HTML provided
-            if not page_content:
-                for url in [
-                    f"{CONFIG['PORTAL_URL']}/candidateHome",
-                    f"{CONFIG['PORTAL_URL']}/dashboard",
-                    f"{CONFIG['PORTAL_URL']}/home"
-                ]:
-                    try:
-                        response = self.session.get(url, timeout=10)
-                        if response.status_code == 200:
-                            page_content = response.text
-                            break
-                    except requests.RequestException:
-                        continue
+            # Helper function to find a header div and grab the value div below it
+            def get_card_value(header_text):
+                header_div = soup.find('div', string=re.compile(header_text, re.I))
+                if header_div:
+                    val_div = header_div.find_next_sibling('div', class_='fs-5')
+                    return val_div.text.strip() if val_div else "N/A"
+                return "N/A"
 
-            # Find exam date
-            for pattern in [
-                r'exam\s*date[:\s]*([0-9\-\/\.]+)',
-                r'scheduled\s*date[:\s]*([0-9\-\/\.]+)'
-            ]:
-                matches = re.findall(pattern, page_content, re.IGNORECASE)
-                if matches:
-                    data['exam_date'] = matches[-1]
-                    logger.info(f"Found exam date: {data['exam_date']}")
-                    break
+            alloc_date = get_card_value("Allocated Date")
+            grade = get_card_value("Grade")
+            function = get_card_value("Function")
+            
+            # Check for Link Status
+            meeting_status = "Not Found"
+            if soup.find('span', string=re.compile("Link will be provided", re.I)):
+                meeting_status = "⏳ Link will be provided (Pending)"
+            elif soup.find('a', string=re.compile("Join", re.I)):
+                # If a link actually exists
+                link_tag = soup.find('a', string=re.compile("Join", re.I))
+                meeting_status = f"✅ Available: {link_tag.get('href')}"
 
-            # Find oral link
-            for pattern in [
-                r'href=["\'](.*?oral.*?)["\']',
-                r'href=["\'](.*?interview.*?)["\']'
-            ]:
-                matches = re.findall(pattern, page_content, re.IGNORECASE)
-                if matches:
-                    link = matches[-1]
-                    if not link.startswith('http'):
-                        link = CONFIG['PORTAL_URL'] + ('/' if not link.startswith('/') else '') + link
-                    data['oral_link'] = link
-                    logger.info(f"Found oral link: {data['oral_link']}")
-                    break
+            # Format and send report
+            report = (
+                "🎯 **Oral Exam Update**\n\n"
+                f"📅 **Allocated Date:** {alloc_date}\n"
+                f"🎓 **Grade:** {grade}\n"
+                f"⚙️ **Function:** {function}\n"
+                f"🔗 **Meeting Link:** {meeting_status}"
+            )
+            
+            print(report)
+            self.send_tg_message(report)
 
         except Exception as e:
-            logger.error(f"Scraping error: {e}")
+            self.send_tg_message(f"Error parsing HTML: {e}")
 
-        return data
-
-    def run(self):
-        """Run bot"""
-        logger.info("="*60)
-        logger.info(f"Starting DGMA check at {datetime.now()}")
-        logger.info("="*60)
-
-        self.send_to_tg('🤖 Starting exam check...', 'info')
-
-        # Login
-        html = self.login()
-        if not html:
-            self.send_to_tg('❌ Check failed - login error', 'error')
-            return
-
-        # Scrape
-        self.send_to_tg('📄 Scraping dashboard...', 'info')
-        data = self.scrape(html)
-
-        # Save to sheet
-        self.send_to_tg('💾 Saving to Google Sheet...', 'info')
-        data['status'] = 'OK'
-        self.append_to_sheet(data)
-
-        self.send_to_tg('✅ Check completed', 'success')
-        logger.info("Check completed successfully")
-
-def test_bot():
-    """Self-check for bot scrapers and helpers"""
-    bot = DGMABot()
-    sample_html = '''
-    <html>
-        <body>
-            <img id="captchaImg" src="data:image/png;base64,ABC123" />
-            <div>Exam Date: 20-10-2026</div>
-            <a href="/portal/oralExamDetails">Oral Exam Link</a>
-        </body>
-    </html>
-    '''
-    data = bot.scrape(sample_html)
-    assert data.get('exam_date') == '20-10-2026', f"Unexpected date: {data.get('exam_date')}"
-    assert 'oralExamDetails' in data.get('oral_link', ''), f"Unexpected link: {data.get('oral_link')}"
+# --- Execution Entry Point ---
+if __name__ == "__main__":
+    # Configure your parameters here
+    TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+    CHAT_ID = "YOUR_CHAT_ID"
+    USERNAME = "YOUR_USERNAME"
+    PASSWORD = "YOUR_PASSWORD"
     
-    match = re.search(r'id="capt[a-z]*Img"[^>]*src="([^"]+)"', sample_html, re.IGNORECASE)
-    assert match and match.group(1) == 'data:image/png;base64,ABC123'
-    logger.info("Self-check passed!")
-
-def main():
-    import sys
-    if '--test' in sys.argv or not CONFIG['DGMA_USERNAME']:
-        logger.info("Running self-check...")
-        test_bot()
-        if '--test' in sys.argv:
-            return
-
-    logger.info("DGMA Bot starting...")
-
-    # Validate config
-    if not CONFIG['DGMA_USERNAME']:
-        logger.error("DGMA_USERNAME not set")
-        raise ValueError("Missing DGMA_USERNAME")
-
-    if not CONFIG['DGMA_PASSWORD']:
-        logger.error("DGMA_PASSWORD not set")
-        raise ValueError("Missing DGMA_PASSWORD")
-
-    bot = DGMABot()
-    bot.run()
-
-if __name__ == '__main__':
-    main()
+    bot = DGMABot(TELEGRAM_TOKEN, CHAT_ID, USERNAME, PASSWORD)
+    
+    if bot.login():
+        bot.check_oral_updates()
