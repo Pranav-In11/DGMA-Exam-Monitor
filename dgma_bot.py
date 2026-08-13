@@ -4,16 +4,20 @@ import time
 import random
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 
 class ProxyRotator:
     def __init__(self):
-        self.proxies = []
+        self.raw_proxies = []
+        self.working_proxies = []  # Temp list storing sorted working proxies
         self.sources = [
             "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=in&timeout=600",
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/IN/data.txt"
         ]
 
     def refresh_proxies(self):
-        """Fetch fresh Indian proxies."""
+        """Fetch fresh raw Indian proxies."""
         new_proxies = []
         for url in self.sources:
             try:
@@ -24,18 +28,73 @@ class ProxyRotator:
             except Exception as e:
                 print(f"Error fetching proxies from {url}: {e}")
         
-        self.proxies = list(set([p.strip() for p in new_proxies if p.strip()]))
-        random.shuffle(self.proxies)
-        print(f"Refreshed {len(self.proxies)} proxies.")
+        self.raw_proxies = list(set([p.strip() for p in new_proxies if p.strip()]))
+        random.shuffle(self.raw_proxies)
+        print(f"Refreshed {len(self.raw_proxies)} raw proxies.")
 
-    def get_proxy(self):
-        if not self.proxies:
-            return None
-        proxy = self.proxies.pop(0)
-        # Ensure it has the protocol
-        if not proxy.startswith('http'):
-            proxy = f"http://{proxy}"
-        return {"http": proxy, "https": proxy}
+    def _check_single_proxy(self, proxy_str, test_url):
+        """Test a single proxy's availability and measure its latency."""
+        if not proxy_str.startswith('http'):
+            proxy_url = f"http://{proxy_str}"
+        else:
+            proxy_url = proxy_str
+        
+        proxy_dict = {"http": proxy_url, "https": proxy_url}
+        start_time = time.time()
+        
+        try:
+            # 0.6-second (600ms) ping test to strictly enforce the latency requirement
+            res = requests.get(test_url, proxies=proxy_dict, timeout=0.6)
+            if res.status_code == 200:
+                latency = time.time() - start_time
+                return (latency, proxy_dict)
+        except Exception:
+            # Fails if it takes longer than 600ms or is unreachable
+            pass
+        return None
+
+    def populate_working_proxies(self, test_url="https://exams.dgma.gov.in", batch_size=30):
+        """Perform parallel check on a batch of proxies and sort working ones by lowest latency."""
+        if not self.raw_proxies:
+            self.refresh_proxies()
+
+        if not self.raw_proxies:
+            return
+
+        print(f"Testing proxy batch ({min(batch_size, len(self.raw_proxies))} candidates) for <= 600ms latency...")
+        candidates = [self.raw_proxies.pop(0) for _ in range(min(batch_size, len(self.raw_proxies)))]
+        
+        working_results = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(self._check_single_proxy, p, test_url) for p in candidates]
+            for future in futures:
+                res = future.result()
+                if res:
+                    working_results.append(res)
+        
+        # Sort by latency (lowest response time first)
+        working_results.sort(key=lambda x: x[0])
+        
+        # Extract just the proxy dicts into our working temp list
+        self.working_proxies = [item[1] for item in working_results]
+        print(f"✓ Found {len(self.working_proxies)} verified proxies under 600ms.")
+
+    def get_proxy(self, test_url="https://exams.dgma.gov.in"):
+        """Get the fastest working proxy available."""
+        if not self.working_proxies:
+            self.populate_working_proxies(test_url=test_url)
+        
+        if self.working_proxies:
+            return self.working_proxies.pop(0)
+        
+        # Direct raw fallback if no proxy passed the quick test
+        if self.raw_proxies:
+            raw = self.raw_proxies.pop(0)
+            if not raw.startswith('http'):
+                raw = f"http://{raw}"
+            return {"http": raw, "https": raw}
+            
+        return None
 
 class DGMABot:
     def __init__(self, telegram_token, chat_id, username, password):
@@ -105,7 +164,7 @@ class DGMABot:
     def solve_captcha(self, base64_image):
         """Try online OCR first, fallback to manual Telegram verification."""
         try:
-            print("Trying free OCR service...")[cite: 1]
+            print("Trying free OCR service...")
             clean_b64 = base64_image.split(',')[1] if ',' in base64_image else base64_image
             response = requests.post('https://api.ocr.space/parse', data={
                 'base64Image': f'data:image/jpeg;base64,{clean_b64}',
@@ -117,7 +176,7 @@ class DGMABot:
             if not result.get('IsErroredOnProcessing') and result.get('ParsedText'):
                 captcha = ''.join(c for c in result['ParsedText'] if c.isalnum())[:6].upper()
                 if len(captcha) >= 4:
-                    self.send_tg_message(f"OCR automatically solved Captcha: {captcha}")[cite: 1]
+                    self.send_tg_message(f"OCR automatically solved Captcha: {captcha}")
                     return captcha
         except Exception as e:
             print(f"OCR error: {e}")
@@ -126,26 +185,25 @@ class DGMABot:
         self.send_tg_message("OCR Failed. Manual verification required.")
         return self.send_tg_photo_and_wait(base64_image)
 
-    def login(self, max_retries=10):
-        """Execute Login with automatic proxy retry and a direct connection fallback."""
+    def login(self, max_retries=25):
+        """Execute Login with automatic proxy retry (25 attempts) and a direct connection fallback."""
         login_url = f"{self.base_url}/j_security_check"
 
-        # --- SAFEGUARD 1: Proxy Retry Loop ---
+        # --- SAFEGUARD 1: Proxy Retry Loop (25+ attempts) ---
         for attempt in range(1, max_retries + 1):
-            proxy = self.rotator.get_proxy()
+            proxy = self.rotator.get_proxy(test_url=self.base_url)
             
-            # If we run out of proxies, refresh the pool
             if not proxy:
-                print("Proxy list exhausted. Refreshing proxies...")
+                print("No proxies available. Refreshing proxy lists...")
                 self.rotator.refresh_proxies()
-                proxy = self.rotator.get_proxy()
+                proxy = self.rotator.get_proxy(test_url=self.base_url)
 
             self.session.proxies = proxy
             print(f"[Attempt {attempt}/{max_retries}] Trying proxy: {proxy.get('http')}")
 
             try:
                 # Load login page to get Captcha (Connect timeout: 5s, Read timeout: 12s)
-                resp = self.session.get(login_url, timeout=(600, 50))
+                resp = self.session.get(login_url, timeout=(5, 12))
                 
                 if resp.status_code != 200:
                     print(f"Bad status code {resp.status_code}, trying next proxy...")
@@ -293,5 +351,5 @@ if __name__ == "__main__":
     
     bot = DGMABot(TELEGRAM_TOKEN, CHAT_ID, USERNAME, PASSWORD)
     
-    if bot.login():
+    if bot.login(max_retries=25):
         bot.check_oral_updates()
