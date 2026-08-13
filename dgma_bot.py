@@ -145,7 +145,7 @@ class DGMABot:
 
             try:
                 # Load login page to get Captcha (Connect timeout: 5s, Read timeout: 12s)
-                resp = self.session.get(login_url, timeout=(5, 12))
+                resp = self.session.get(login_url, timeout=(600, 50))
                 
                 if resp.status_code != 200:
                     print(f"Bad status code {resp.status_code}, trying next proxy...")
