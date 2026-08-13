@@ -10,8 +10,6 @@ class ProxyRotator:
         self.proxies = []
         self.sources = [
             "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=in&timeout=600",
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/IN/data.txt"
         ]
 
     def refresh_proxies(self):
